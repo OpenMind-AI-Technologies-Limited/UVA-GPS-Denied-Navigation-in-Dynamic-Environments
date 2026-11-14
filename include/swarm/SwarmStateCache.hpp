@@ -1,6 +1,7 @@
 #pragma once
 
 #include "swarm/EdgePeerProtocol.hpp"
+#include "swarm/ReplayJournal.hpp"
 
 #include <Eigen/Core>
 
@@ -20,6 +21,8 @@ struct CachedPeerState {
     uint64_t last_pose_timestamp_ms{0};
     uint64_t last_obstacle_digest_timestamp_ms{0};
     uint32_t last_sequence_number{0};
+    // Bit 0 is the highest seen sequence; older authenticated packets use higher bits.
+    uint64_t replay_window_bitmap{1u};
     uint64_t trust_epoch{0};
     double localization_confidence{0.0};
     Eigen::Vector3d position{Eigen::Vector3d::Zero()};
@@ -47,6 +50,13 @@ struct SwarmStateCacheConfig {
     size_t max_entries{32};
     uint32_t stale_peer_timeout_ms{900};
     uint32_t entry_expiry_ms{2500};
+    uint64_t accepted_clock_skew_ms{0};
+    uint32_t maximum_authenticated_ttl_ms{0};
+};
+
+struct SwarmCacheFreshnessPolicy {
+    uint64_t clock_skew_ms{0};
+    uint32_t max_authenticated_ttl_ms{0};
 };
 
 struct SwarmStateCacheObservation {
@@ -62,6 +72,9 @@ public:
     SwarmStateCacheObservation observe_packet(const EdgePeerPacket& packet, uint64_t now_ms);
     void expire(uint64_t now_ms);
     void clear();
+    void configure_freshness(SwarmCacheFreshnessPolicy policy);
+    [[nodiscard]] bool configure_replay_ledger(const std::string& path,
+                                               bool initialize_new = false);
 
     [[nodiscard]] size_t peer_count() const;
     [[nodiscard]] size_t stale_peer_count() const;
@@ -78,6 +91,7 @@ private:
     SwarmStateCacheConfig config_{};
     mutable std::mutex mutex_{};
     std::unordered_map<uint32_t, CachedPeerState> peers_{};
+    ReplayJournal replay_journal_{};
 };
 
 } // namespace drone::swarm

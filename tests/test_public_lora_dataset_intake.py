@@ -1,0 +1,229 @@
+"""Offline regression tests for public LoRa metadata and checksum intake."""
+
+import hashlib
+import io
+import json
+import os
+import tempfile
+import urllib.request
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts import public_lora_dataset_intake as intake
+
+
+def fixture_file(payload=b"flight-demo-fixture-only"):
+    return {
+        "filename": "measurements.csv",
+        "size": len(payload),
+        "content_details": {
+            "sha256_hash": hashlib.sha256(payload).hexdigest(),
+            "size": len(payload),
+            "download_url": "https://data.mendeley.com/content/fixture.csv",
+        },
+    }
+
+
+class PublicRadioDatasetIntakeTests(unittest.TestCase):
+    def metadata(self, files=None):
+        return {
+            "id": intake.DATASET_ID,
+            "version": intake.VERSION,
+            "files": files if files is not None else [fixture_file()],
+        }
+
+    def test_approved_metadata_and_manifest(self):
+        data = self.metadata()
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(intake, "read_catalog", return_value=data):
+                report = intake.acquire(Path(directory))
+            saved = json.loads(
+                (Path(directory) / "public-dataset-integrity.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        self.assertFalse(report["is_uav_fanet_capture"])
+        self.assertFalse(report["full_sender_tx_inventory_verified"])
+        self.assertEqual(saved["dataset_version"], 2)
+        self.assertEqual(report["files"][0]["filename"], "measurements.csv")
+
+    def test_verified_download_then_reuse(self):
+        payload = b"synthetic-radio-data-not-a-field-trial"
+        item = intake.catalog_files(self.metadata([fixture_file(payload)]))[0]
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            with patch.object(intake, "open_url", return_value=io.BytesIO(payload)):
+                first = intake.stream_verified_file(item, folder)
+            second = intake.stream_verified_file(item, folder)
+            self.assertEqual((folder / item["filename"]).read_bytes(), payload)
+        self.assertFalse(first["reused"])
+        self.assertTrue(second["reused"])
+
+    def test_tampered_download_never_published(self):
+        item = intake.catalog_files(self.metadata())[0]
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            wrong = b"x" * item["size"]
+            with patch.object(intake, "open_url", return_value=io.BytesIO(wrong)):
+                with self.assertRaisesRegex(ValueError, "SHA-256"):
+                    intake.stream_verified_file(item, folder)
+            self.assertFalse((folder / item["filename"]).exists())
+
+    def test_existing_tampered_capture_is_not_overwritten(self):
+        item = intake.catalog_files(self.metadata())[0]
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            target = folder / item["filename"]
+            target.write_text("tampered", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "existing file"):
+                intake.stream_verified_file(item, folder)
+            self.assertEqual(target.read_text(encoding="utf-8"), "tampered")
+
+    def test_bad_origin_rejected(self):
+        for url in (
+            "http://data.mendeley.com/files/1",
+            "https://127.0.0.1/file",
+            "https://evil.example.com/payload",
+            "https://user:password@api.data.mendeley.com/file",
+            "file:///etc/passwd",
+        ):
+            self.assertFalse(intake.trusted_download_url(url), url)
+
+    def test_unsigned_metadata_or_unknown_files_not_accepted(self):
+        bad = fixture_file()
+        bad["content_details"]["sha256_hash"] = "unverified"
+        with self.assertRaisesRegex(ValueError, "SHA-256"):
+            intake.catalog_files(self.metadata([bad]))
+        missing = fixture_file()
+        missing["filename"] = "../private.csv"
+        with self.assertRaisesRegex(ValueError, "no recognized"):
+            intake.catalog_files(self.metadata([missing]))
+
+    def test_api_token_only_applies_to_pinned_publisher_host(self):
+        with patch.dict(
+            os.environ, {"MENDELEY_DATA_ACCESS_TOKEN": "private-api-token"}
+        ):
+            with patch.object(intake.urllib.request, "build_opener") as builder:
+                intake.open_url(intake.API)
+                request = builder.return_value.open.call_args.args[0]
+                self.assertEqual(
+                    request.get_header("Authorization"),
+                    "Bearer private-api-token",
+                )
+                intake.open_url("https://storage.googleapis.com/public/test")
+                external = builder.return_value.open.call_args.args[0]
+                self.assertIsNone(external.get_header("Authorization"))
+
+    def test_api_token_is_removed_before_any_redirect(self):
+        request = urllib.request.Request(
+            intake.API, headers={"Authorization": "Bearer private-api-token"}
+        )
+        redirected = intake.ApprovedRedirects().redirect_request(
+            request,
+            None,
+            307,
+            "Temporary Redirect",
+            {},
+            "https://storage.googleapis.com/publisher/archive.zip",
+        )
+        self.assertIsNotNone(redirected)
+        self.assertIsNone(redirected.get_header("Authorization"))
+
+    def test_catalog_identity_and_version_are_pinned(self):
+        with patch.object(
+            intake,
+            "open_url",
+            return_value=io.BytesIO(
+                json.dumps({"id": "another", "version": 2}).encode()
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "dataset ID"):
+                intake.read_catalog()
+        with patch.object(
+            intake,
+            "open_url",
+            return_value=io.BytesIO(
+                json.dumps({"id": intake.DATASET_ID, "version": 3}).encode()
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "published version"):
+                intake.read_catalog()
+
+    def test_public_short_id_can_accompany_internal_uuid(self):
+        data = self.metadata()
+        data["id"] = "30ae499e-5abb-42d3-8f6e-6d3f93e427fa"
+        data["short_id"] = intake.DATASET_ID
+        data["doi"] = {"id": intake.DOI}
+        stream = io.BytesIO(json.dumps(data).encode())
+        with patch.object(intake, "open_url", return_value=stream):
+            result = intake.read_catalog()
+        self.assertEqual(result["short_id"], intake.DATASET_ID)
+
+    def test_internal_uuid_with_exact_doi_is_accepted(self):
+        data = self.metadata()
+        data["id"] = "30ae499e-5abb-42d3-8f6e-6d3f93e427fa"
+        data["doi"] = {"id": intake.DOI}
+        stream = io.BytesIO(json.dumps(data).encode())
+        with patch.object(intake, "open_url", return_value=stream):
+            result = intake.read_catalog()
+        self.assertEqual(result["version"], intake.VERSION)
+
+    def test_wrong_public_short_id_is_rejected(self):
+        data = self.metadata()
+        data["short_id"] = "another-dataset"
+        stream = io.BytesIO(json.dumps(data).encode())
+        with patch.object(intake, "open_url", return_value=stream):
+            with self.assertRaisesRegex(ValueError, "dataset ID"):
+                intake.read_catalog()
+
+    def test_mismatched_doi_is_rejected(self):
+        data = self.metadata()
+        data["doi"] = {"id": "10.17632/other.2"}
+        stream = io.BytesIO(json.dumps(data).encode())
+        with patch.object(intake, "open_url", return_value=stream):
+            with self.assertRaisesRegex(ValueError, "DOI differs"):
+                intake.read_catalog()
+
+    def test_official_files_endpoint_used_when_catalog_has_no_files(self):
+        data = self.metadata()
+        del data["files"]
+        pages = [
+            io.BytesIO(json.dumps(data).encode()),
+            io.BytesIO(json.dumps([fixture_file()]).encode()),
+        ]
+        with patch.object(intake, "open_url", side_effect=pages) as opened:
+            result = intake.read_catalog()
+        self.assertEqual(len(result["files"]), 1)
+        self.assertEqual(opened.call_args_list[1].args[0], intake.FILES_API)
+
+    def test_missing_signed_url_uses_official_file_redirect_endpoint(self):
+        entry = fixture_file()
+        entry["id"] = "01234567-89ab-4def-8123-0123456789ab"
+        entry["content_details"]["download_url"] = None
+        data = self.metadata([entry])
+        selected = intake.catalog_files(data)
+        self.assertEqual(
+            selected[0]["download_url"],
+            "https://api.data.mendeley.com/datasets/jm58sggtj7/files/"
+            "01234567-89ab-4def-8123-0123456789ab/file_downloaded?version=2",
+        )
+
+    def test_missing_url_without_valid_file_id_is_rejected(self):
+        entry = fixture_file()
+        entry["id"] = "../bogus"
+        entry["content_details"]["download_url"] = None
+        with self.assertRaisesRegex(ValueError, "file UUID"):
+            intake.catalog_files(self.metadata([entry]))
+
+    def test_metadata_cannot_replace_verifiable_raw_source(self):
+        result = self.metadata([fixture_file()])
+        with patch.object(intake, "read_catalog", return_value=result):
+            with tempfile.TemporaryDirectory() as directory:
+                report = intake.acquire(Path(directory), download=False)
+        self.assertFalse(report["physical_field_provenance_independently_verified"])
+        self.assertFalse(report["radio_packet_loss_causal_attribution_established"])
+
+
+if __name__ == "__main__":
+    unittest.main()

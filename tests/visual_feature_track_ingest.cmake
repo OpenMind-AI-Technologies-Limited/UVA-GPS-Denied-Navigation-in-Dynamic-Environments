@@ -13,6 +13,7 @@ add_executable(test_visual_feature_track_manager
 target_link_libraries(test_visual_feature_track_manager PRIVATE
     drone_test_support
     Eigen3::Eigen
+    spdlog::spdlog
 )
 drone_apply_project_warnings(test_visual_feature_track_manager)
 drone_enable_coverage(test_visual_feature_track_manager)
@@ -60,4 +61,26 @@ drone_set_target_output_dirs(visual_feature_track_ingest_replay "tests" "tests" 
 add_test(NAME visual_feature_track_ingest_replay COMMAND $<TARGET_FILE:visual_feature_track_ingest_replay>)
 set_tests_properties(visual_feature_track_ingest_replay PROPERTIES
     LABELS "integration;navigation;replay;shadow-only;visual-feature-tracking"
+)
+
+# Link the localization regression through the production core target so every
+# compiler sees the same dependencies, definitions, and warning configuration.
+add_executable(test_localization_metadata_fail_closed
+    "${CMAKE_CURRENT_LIST_DIR}/test_localization_metadata_fail_closed.cpp"
+)
+target_link_libraries(test_localization_metadata_fail_closed PRIVATE
+    drone_test_support
+    sensor_fusion_core
+    Eigen3::Eigen
+)
+drone_apply_project_warnings(test_localization_metadata_fail_closed)
+drone_enable_coverage(test_localization_metadata_fail_closed)
+drone_enable_sanitizers(test_localization_metadata_fail_closed)
+drone_set_target_output_dirs(test_localization_metadata_fail_closed "tests" "tests" "tests")
+add_test(
+    NAME test_localization_metadata_fail_closed
+    COMMAND $<TARGET_FILE:test_localization_metadata_fail_closed>
+)
+set_tests_properties(test_localization_metadata_fail_closed PROPERTIES
+    LABELS "unit;navigation;localization;safety"
 )

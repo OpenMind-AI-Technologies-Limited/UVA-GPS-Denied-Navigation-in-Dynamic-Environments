@@ -1,4 +1,5 @@
 #include "security/PeerPacketAuth.hpp"
+#include "monocypher.h"
 
 #include <algorithm>
 #include <array>
@@ -302,6 +303,10 @@ std::string_view to_string(AuthMode mode) {
         return "ed25519_placeholder";
     case AuthMode::PQC_HYBRID_PLACEHOLDER:
         return "pqc_hybrid_placeholder";
+    case AuthMode::PER_NODE_HMAC_SHA256:
+        return "hmac_sha256_per_node";
+    case AuthMode::MONOCYPHER_EDDSA_BLAKE2B:
+        return "monocypher_eddsa_blake2b";
     }
     return "unknown";
 }
@@ -316,6 +321,10 @@ std::optional<AuthMode> parse_auth_mode(std::string_view value) {
         return AuthMode::ED25519_PLACEHOLDER;
     if (lower == "pqc_hybrid_placeholder")
         return AuthMode::PQC_HYBRID_PLACEHOLDER;
+    if (lower == "hmac_sha256_per_node")
+        return AuthMode::PER_NODE_HMAC_SHA256;
+    if (lower == "monocypher_eddsa_blake2b")
+        return AuthMode::MONOCYPHER_EDDSA_BLAKE2B;
     return std::nullopt;
 }
 
@@ -335,8 +344,30 @@ std::string_view to_string(PacketAuthResult result) {
         return "stale_epoch";
     case PacketAuthResult::REPLAY_DETECTED:
         return "replay_detected";
+    case PacketAuthResult::INVALID_TTL:
+        return "invalid_ttl";
+    case PacketAuthResult::FUTURE_TIMESTAMP:
+        return "future_timestamp";
+    case PacketAuthResult::STALE_TIMESTAMP:
+        return "stale_timestamp";
+    case PacketAuthResult::UNTRUSTED_SENDER:
+        return "untrusted_sender";
     }
     return "unknown";
+}
+
+std::array<uint8_t, 32> monocypherPublicKeyFromSeed(std::array<uint8_t, 32> secret_seed) {
+    std::array<uint8_t, 64> signing_key{};
+    std::array<uint8_t, 32> public_key{};
+    crypto_eddsa_key_pair(signing_key.data(), public_key.data(), secret_seed.data());
+    crypto_wipe(signing_key.data(), signing_key.size());
+    crypto_wipe(secret_seed.data(), secret_seed.size());
+    return public_key;
+}
+
+std::array<uint8_t, 32> hmacSha256Digest(std::string_view secret,
+                                         const std::vector<uint8_t>& data) {
+    return hmac_sha256_bytes(secret, data);
 }
 
 std::array<uint8_t, 32> canonicalPayloadHash(const drone::swarm::EdgePeerPacket& packet) {
@@ -372,6 +403,47 @@ PacketAuthOutcome signPacket(drone::swarm::EdgePeerPacket& packet, const PacketA
         return outcome(PacketAuthResult::UNSUPPORTED,
                        "Ed25519 auth is placeholder-only in this build.");
     }
+    if (config.mode == AuthMode::MONOCYPHER_EDDSA_BLAKE2B ||
+        config.mode == AuthMode::PER_NODE_HMAC_SHA256) {
+        if (config.revoked_sender_ids.contains(packet.sender_id)) {
+            return outcome(PacketAuthResult::UNTRUSTED_SENDER, "local sender has been revoked");
+        }
+    }
+    if (config.mode == AuthMode::MONOCYPHER_EDDSA_BLAKE2B) {
+        if (config.local_node_id == 0 || packet.sender_id != config.local_node_id) {
+            return outcome(PacketAuthResult::UNTRUSTED_SENDER,
+                           "asymmetric signing identity does not match sender");
+        }
+        if (!config.local_eddsa_seed.has_value()) {
+            return outcome(PacketAuthResult::MISSING_SIGNATURE,
+                           "no local EdDSA signing seed is provisioned");
+        }
+        auto seed = config.local_eddsa_seed.value_or(std::array<uint8_t, 32>{});
+        std::array<uint8_t, 64> signing_key{};
+        std::array<uint8_t, 32> public_key{};
+        crypto_eddsa_key_pair(signing_key.data(), public_key.data(), seed.data());
+        const auto bytes = canonical_bytes(packet);
+        std::array<uint8_t, 64> signature{};
+        crypto_eddsa_sign(signature.data(), signing_key.data(), bytes.data(), bytes.size());
+        crypto_wipe(seed.data(), seed.size());
+        crypto_wipe(signing_key.data(), signing_key.size());
+        packet.auth_hook = "monocypher_eddsa_blake2b:";
+        packet.auth_hook += hex_encode(signature.data(), signature.size());
+        return outcome(PacketAuthResult::ACCEPTED, "packet signed with Monocypher EdDSA");
+    }
+    if (config.mode == AuthMode::PER_NODE_HMAC_SHA256) {
+        if (config.local_node_id == 0 || packet.sender_id != config.local_node_id) {
+            return outcome(PacketAuthResult::UNTRUSTED_SENDER,
+                           "packet sender does not match local signing identity");
+        }
+        if (config.local_signing_secret.size() < 32u) {
+            return outcome(PacketAuthResult::MISSING_SIGNATURE,
+                           "per-node signing key must contain at least 32 bytes");
+        }
+        const auto mac = hmac_sha256_bytes(config.local_signing_secret, canonical_bytes(packet));
+        packet.auth_hook = std::string("hmac_sha256_node:") + hex_encode(mac.data(), mac.size());
+        return outcome(PacketAuthResult::ACCEPTED, "packet signed with local node key");
+    }
     const auto secret = effective_secret(config);
     if (secret.empty()) {
         return outcome(PacketAuthResult::MISSING_SIGNATURE, "HMAC shared secret missing");
@@ -392,18 +464,41 @@ PacketAuthOutcome verifyPacket(const drone::swarm::EdgePeerPacket& packet,
         return outcome(PacketAuthResult::UNSUPPORTED,
                        "Ed25519 auth is placeholder-only in this build.");
     }
-    const auto age =
-        now_ms > packet.timestamp_ms ? now_ms - packet.timestamp_ms : packet.timestamp_ms - now_ms;
-    if (config.max_clock_skew_ms > 0 && age > config.max_clock_skew_ms + packet.ttl_ms) {
-        return outcome(PacketAuthResult::REJECTED, "packet timestamp outside auth clock skew");
+    // Time and TTL have different roles: TTL never expands the permitted future clock skew.
+    // Subtractions avoid unsigned overflow near the end of the timestamp space.
+    if (packet.ttl_ms == 0 || config.max_packet_ttl_ms == 0 ||
+        packet.ttl_ms > config.max_packet_ttl_ms) {
+        return outcome(PacketAuthResult::INVALID_TTL, "packet TTL outside configured bounds");
+    }
+    if (packet.timestamp_ms > now_ms) {
+        if (packet.timestamp_ms - now_ms > config.max_clock_skew_ms) {
+            return outcome(PacketAuthResult::FUTURE_TIMESTAMP,
+                           "packet timestamp exceeds future clock skew");
+        }
+    } else {
+        const auto elapsed = now_ms - packet.timestamp_ms;
+        if (elapsed > config.max_clock_skew_ms &&
+            elapsed - config.max_clock_skew_ms > packet.ttl_ms) {
+            return outcome(PacketAuthResult::STALE_TIMESTAMP,
+                           "packet timestamp exceeds TTL and clock skew");
+        }
     }
     if (auto epoch = validateTrustEpoch(packet, config); !epoch.accepted()) {
         return epoch;
     }
-    if (auto replay = validateNonceOrSequence(packet, last_sequence_number); !replay.accepted()) {
-        return replay;
+    // Revocation is meaningful only when different senders have separate
+    // secrets or public keys. Group HMAC cannot guarantee sender isolation.
+    if (config.mode == AuthMode::MONOCYPHER_EDDSA_BLAKE2B ||
+        config.mode == AuthMode::PER_NODE_HMAC_SHA256) {
+        if (config.revoked_sender_ids.contains(packet.sender_id)) {
+            return outcome(PacketAuthResult::UNTRUSTED_SENDER, "claimed sender has been revoked");
+        }
     }
     if (config.mode == AuthMode::NONE) {
+        if (auto replay = validateNonceOrSequence(packet, last_sequence_number);
+            !replay.accepted()) {
+            return replay;
+        }
         if (unsigned_allowed_for_profile(packet, config)) {
             return outcome(PacketAuthResult::ACCEPTED,
                            "unsigned packet accepted for simulation/debug");
@@ -414,7 +509,42 @@ PacketAuthOutcome verifyPacket(const drone::swarm::EdgePeerPacket& packet,
     if (packet.auth_hook.empty() || packet.auth_hook == "unsigned") {
         return outcome(PacketAuthResult::MISSING_SIGNATURE, "missing packet signature");
     }
-    constexpr std::string_view prefix = "hmac_sha256:";
+    if (config.mode == AuthMode::MONOCYPHER_EDDSA_BLAKE2B) {
+        constexpr std::string_view tag = "monocypher_eddsa_blake2b:";
+        if (packet.auth_hook.rfind(tag, 0) != 0) {
+            return outcome(PacketAuthResult::INVALID_SIGNATURE,
+                           "packet signature algorithm mismatch");
+        }
+        const auto peer = config.trusted_node_public_keys.find(packet.sender_id);
+        if (packet.sender_id == 0 || peer == config.trusted_node_public_keys.end()) {
+            return outcome(PacketAuthResult::UNTRUSTED_SENDER,
+                           "no public verification key for claimed sender");
+        }
+        const auto provided = hex_decode(std::string_view(packet.auth_hook).substr(tag.size()));
+        if (!provided.has_value()) {
+            return outcome(PacketAuthResult::INVALID_SIGNATURE,
+                           "invalid Monocypher signature encoding");
+        }
+        if (provided->size() != 64u) {
+            return outcome(PacketAuthResult::INVALID_SIGNATURE,
+                           "invalid Monocypher signature length");
+        }
+        const auto bytes = canonical_bytes(packet);
+        const auto* signature = provided->data();
+        const auto* public_key = peer->second.data();
+        const int verified = crypto_eddsa_check(signature, public_key, bytes.data(), bytes.size());
+        if (verified != 0) {
+            return outcome(PacketAuthResult::INVALID_SIGNATURE,
+                           "Monocypher signature verification failed");
+        }
+        if (auto replay = validateNonceOrSequence(packet, last_sequence_number);
+            !replay.accepted()) {
+            return replay;
+        }
+        return outcome(PacketAuthResult::ACCEPTED, "EdDSA public-key verification accepted");
+    }
+    const bool per_node_mode = config.mode == AuthMode::PER_NODE_HMAC_SHA256;
+    const std::string_view prefix = per_node_mode ? "hmac_sha256_node:" : "hmac_sha256:";
     if (packet.auth_hook.rfind(prefix, 0) != 0) {
         return outcome(PacketAuthResult::INVALID_SIGNATURE, "packet signature algorithm mismatch");
     }
@@ -422,13 +552,30 @@ PacketAuthOutcome verifyPacket(const drone::swarm::EdgePeerPacket& packet,
     if (!provided.has_value()) {
         return outcome(PacketAuthResult::INVALID_SIGNATURE, "packet signature encoding invalid");
     }
-    const auto secret = effective_secret(config);
-    if (secret.empty()) {
-        return outcome(PacketAuthResult::MISSING_SIGNATURE, "HMAC shared secret missing");
+    std::string group_secret;
+    std::string_view verification_key;
+    if (per_node_mode) {
+        const auto peer = config.trusted_node_secrets.find(packet.sender_id);
+        if (packet.sender_id == 0 || peer == config.trusted_node_secrets.end() ||
+            peer->second.size() < 32u) {
+            return outcome(PacketAuthResult::UNTRUSTED_SENDER,
+                           "no valid verification key for claimed sender");
+        }
+        verification_key = peer->second;
+    } else {
+        group_secret = effective_secret(config);
+        if (group_secret.empty()) {
+            return outcome(PacketAuthResult::MISSING_SIGNATURE, "HMAC shared secret missing");
+        }
+        verification_key = group_secret;
     }
-    const auto expected = hmac_sha256_bytes(secret, canonical_bytes(packet));
+    const auto expected = hmac_sha256_bytes(verification_key, canonical_bytes(packet));
     if (!constant_time_equal(*provided, expected)) {
         return outcome(PacketAuthResult::INVALID_SIGNATURE, "packet signature verification failed");
+    }
+    // Only authenticated packets receive authoritative replay classification in HMAC mode.
+    if (auto replay = validateNonceOrSequence(packet, last_sequence_number); !replay.accepted()) {
+        return replay;
     }
     return outcome(PacketAuthResult::ACCEPTED, "packet authentication accepted");
 }

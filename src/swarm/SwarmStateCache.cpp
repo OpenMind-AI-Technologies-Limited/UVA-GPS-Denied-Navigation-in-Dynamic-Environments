@@ -1,30 +1,103 @@
 #include "swarm/SwarmStateCache.hpp"
 
 #include <algorithm>
+#include <limits>
 
 namespace drone::swarm {
 
-SwarmStateCache::SwarmStateCache(SwarmStateCacheConfig config) : config_(std::move(config)) {}
+SwarmStateCache::SwarmStateCache(SwarmStateCacheConfig config) : config_(config) {}
 
 SwarmStateCacheObservation SwarmStateCache::observe_packet(const EdgePeerPacket& packet,
                                                            uint64_t now_ms) {
     SwarmStateCacheObservation result;
     std::lock_guard lock(mutex_);
+    if (!replay_journal_.healthy()) {
+        result.reason = "replay journal unavailable";
+        return result;
+    }
 
-    const auto existing = peers_.find(packet.sender_id);
+    // Perform non-replay packet validation first; replay bits are committed atomically
+    // under the cache mutex only after the candidate has passed all basic checks.
     const auto validation = validate_edge_packet(
-        packet, {
-                    now_ms,
-                    existing != peers_.end() ? existing->second.last_sequence_number : 0u,
-                    existing != peers_.end(),
-                    1400u,
-                });
+        packet, {now_ms, 0u, false, 1400u, 0u, config_.accepted_clock_skew_ms});
     if (!validation.ok) {
         result.reason = validation.error;
         return result;
     }
 
+    constexpr uint32_t replay_window_size = 64u;
+    const auto existing = peers_.find(packet.sender_id);
+    std::optional<ReplayLedgerRecord> old;
+    if (replay_journal_.enabled()) {
+        if (const auto* saved = replay_journal_.find(packet.sender_id); saved != nullptr) {
+            old = *saved;
+        }
+    }
+    if (!old.has_value() && existing != peers_.end()) {
+        old = ReplayLedgerRecord{packet.sender_id, existing->second.trust_epoch,
+                                 existing->second.last_sequence_number,
+                                 existing->second.replay_window_bitmap};
+    }
+
+    uint64_t next_replay_bitmap = 1u;
+    bool reordered = false;
+    if (old.has_value()) {
+        const auto& previous = old.value();
+        if (packet.trust_epoch < previous.epoch) {
+            result.reason = "stale trust epoch";
+            return result;
+        }
+        if (packet.trust_epoch == previous.epoch) {
+            if (packet.sequence_number > previous.highest_sequence) {
+                const uint32_t advance = packet.sequence_number - previous.highest_sequence;
+                next_replay_bitmap = advance >= replay_window_size
+                                         ? uint64_t{1}
+                                         : (previous.bitmap << advance) | uint64_t{1};
+            } else {
+                const uint32_t distance = previous.highest_sequence - packet.sequence_number;
+                if (distance >= replay_window_size) {
+                    result.reason = "sequence outside replay window";
+                    return result;
+                }
+                const uint64_t mask = uint64_t{1} << distance;
+                if ((previous.bitmap & mask) != 0u) {
+                    result.reason = "stale sequence number";
+                    return result;
+                }
+                next_replay_bitmap = previous.bitmap | mask;
+                reordered = true;
+            }
+        }
+    }
+
+    if (replay_journal_.enabled()) {
+        if (replay_journal_.find(packet.sender_id) == nullptr &&
+            replay_journal_.peer_count() >= config_.max_entries) {
+            result.reason = "replay journal peer limit reached";
+            return result;
+        }
+        // Write+sync before updating in-memory state or admitting the packet.
+        const uint32_t high =
+            reordered && old.has_value() ? old->highest_sequence : packet.sequence_number;
+        const ReplayLedgerRecord record{packet.sender_id, packet.trust_epoch, high,
+                                        next_replay_bitmap};
+        if (!replay_journal_.persist(record)) {
+            result.reason = "replay journal write failed";
+            return result;
+        }
+    }
+
+    if (reordered) {
+        if (existing != peers_.end()) {
+            existing->second.replay_window_bitmap = next_replay_bitmap;
+        }
+        // A reordered packet cannot roll back the current presentation state.
+        result.accepted = true;
+        return result;
+    }
+
     auto& peer = peers_[packet.sender_id];
+    peer.replay_window_bitmap = next_replay_bitmap;
     peer.peer_id = packet.sender_id;
     peer.last_packet_timestamp_ms = packet.timestamp_ms;
     peer.last_sequence_number = packet.sequence_number;
@@ -86,7 +159,14 @@ void SwarmStateCache::expire(uint64_t now_ms) {
         const auto age_ms = now_ms > it->second.last_packet_timestamp_ms
                                 ? (now_ms - it->second.last_packet_timestamp_ms)
                                 : 0u;
-        if (age_ms > config_.entry_expiry_ms) {
+        // Retain the peer sequence while an earlier signed packet may still be fresh.
+        const uint64_t max_age =
+            config_.accepted_clock_skew_ms >
+                    std::numeric_limits<uint64_t>::max() - config_.maximum_authenticated_ttl_ms
+                ? std::numeric_limits<uint64_t>::max()
+                : config_.accepted_clock_skew_ms + config_.maximum_authenticated_ttl_ms;
+        const uint64_t retention_ms = std::max<uint64_t>(config_.entry_expiry_ms, max_age);
+        if (age_ms > retention_ms) {
             it = peers_.erase(it);
             continue;
         }
@@ -94,6 +174,28 @@ void SwarmStateCache::expire(uint64_t now_ms) {
         it->second.split_swarm_isolated = it->second.stale || it->second.disconnected_operation;
         ++it;
     }
+}
+
+void SwarmStateCache::configure_freshness(SwarmCacheFreshnessPolicy policy) {
+    std::lock_guard lock(mutex_);
+    config_.accepted_clock_skew_ms = policy.clock_skew_ms;
+    config_.maximum_authenticated_ttl_ms = policy.max_authenticated_ttl_ms;
+}
+
+bool SwarmStateCache::configure_replay_ledger(const std::string& path, bool initialize_new) {
+    std::lock_guard lock(mutex_);
+    if (!peers_.empty()) {
+        // Activating durability after peer admission would miss historical packets.
+        return replay_journal_.configure("", false);
+    }
+    if (!replay_journal_.configure(path, initialize_new)) {
+        return false;
+    }
+    if (replay_journal_.peer_count() > config_.max_entries) {
+        // A second configure call will fail closed rather than silently truncate history.
+        return replay_journal_.configure("", false);
+    }
+    return true;
 }
 
 void SwarmStateCache::clear() {
@@ -139,10 +241,13 @@ bool SwarmStateCache::split_swarm_isolated() const {
 std::optional<uint32_t> SwarmStateCache::last_sequence_number(uint32_t peer_id) const {
     std::lock_guard lock(mutex_);
     const auto it = peers_.find(peer_id);
-    if (it == peers_.end()) {
-        return std::nullopt;
+    if (it != peers_.end()) {
+        return it->second.last_sequence_number;
     }
-    return it->second.last_sequence_number;
+    if (const auto* persisted = replay_journal_.find(peer_id); persisted != nullptr) {
+        return persisted->highest_sequence;
+    }
+    return std::nullopt;
 }
 
 std::optional<CachedPeerState> SwarmStateCache::peer_state(uint32_t peer_id) const {

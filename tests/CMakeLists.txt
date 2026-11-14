@@ -360,6 +360,13 @@ add_executable(test_boot_trust
 target_link_libraries(test_boot_trust PRIVATE drone_test_support)
 drone_register_gtest(test_boot_trust "unit;security")
 
+add_executable(test_firmware_review
+    test_firmware_review.cpp
+    ../third_party/crypto/sha3.c
+)
+target_link_libraries(test_firmware_review PRIVATE drone_test_support)
+drone_register_gtest(test_firmware_review "unit;security;firmware-review")
+
 add_executable(test_telemetry test_telemetry.cpp)
 target_link_libraries(test_telemetry PRIVATE
     drone_test_support
@@ -369,6 +376,7 @@ drone_register_gtest(test_telemetry "unit;telemetry")
 
 add_executable(test_edge_swarm
     test_edge_swarm.cpp
+    ../third_party/crypto/monocypher.c
     ../src/security/PeerPacketAuth.cpp
     ../src/swarm/EdgeConsensusManager.cpp
     ../src/swarm/EdgePeerProtocol.cpp
@@ -393,4 +401,28 @@ if(DRONE_HAVE_FASTDDS_TRANSPORT)
     drone_set_target_output_dirs(test_v2x "tests" "tests" "tests")
     add_test(NAME test_v2x COMMAND $<TARGET_FILE:test_v2x>)
     set_tests_properties(test_v2x PROPERTIES LABELS "integration;swarm;simulation")
+endif()
+
+# Native end-to-end comparison: the same generated receiver trace must produce
+# identical per-arrival replay decisions in Python and the production C++ cache.
+add_executable(peer_replay_cache_cli peer_replay_cache_cli.cpp)
+target_link_libraries(peer_replay_cache_cli PRIVATE sensor_fusion_core Eigen3::Eigen)
+drone_apply_project_warnings(peer_replay_cache_cli)
+drone_set_target_output_dirs(peer_replay_cache_cli "tests" "tests" "tests")
+
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+    add_test(
+        NAME peer_replay_native_parity
+        COMMAND "${Python3_EXECUTABLE}"
+                "${PROJECT_SOURCE_DIR}/scripts/peer_replay_scenario_study.py"
+                --native "$<TARGET_FILE:peer_replay_cache_cli>"
+                --seeds 6
+                --packets-per-peer 180
+                --output "${PROJECT_BINARY_DIR}/peer_replay_native_results.json"
+    )
+    set_tests_properties(peer_replay_native_parity PROPERTIES
+        LABELS "integration;security;swarm;replay"
+        TIMEOUT 180
+    )
 endif()

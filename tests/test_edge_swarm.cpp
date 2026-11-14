@@ -1,8 +1,13 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <limits>
+#include <vector>
 #include <utility>
 
 #include "swarm/EdgeConsensusManager.hpp"
@@ -15,6 +20,8 @@ using namespace drone::security;
 
 namespace {
 
+// Test fixtures use fixed positional packet fields for readability.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 EdgePeerPacket heartbeat(uint32_t sender_id, uint64_t timestamp_ms, uint32_t sequence_number) {
     EdgePeerPacket packet;
     packet.packet_type = EdgePacketType::HEARTBEAT;
@@ -31,6 +38,8 @@ EdgePeerPacket heartbeat(uint32_t sender_id, uint64_t timestamp_ms, uint32_t seq
     return packet;
 }
 
+// Test fixtures use fixed positional packet fields for readability.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 EdgePeerPacket consensus(uint32_t sender_id, uint64_t timestamp_ms, uint32_t sequence_number,
                          uint64_t epoch, ConsensusProposalType proposal) {
     EdgePeerPacket packet;
@@ -48,6 +57,8 @@ EdgePeerPacket consensus(uint32_t sender_id, uint64_t timestamp_ms, uint32_t seq
     return packet;
 }
 
+// Test fixtures use fixed positional packet fields for readability.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 EdgePeerPacket emergency_corridor(uint32_t sender_id, uint64_t timestamp_ms,
                                   uint32_t sequence_number) {
     EdgePeerPacket packet;
@@ -68,6 +79,8 @@ EdgePeerPacket emergency_corridor(uint32_t sender_id, uint64_t timestamp_ms,
     return packet;
 }
 
+// Test fixtures use fixed positional packet fields for readability.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 EdgePeerPacket obstacle_digest(uint32_t sender_id, uint64_t timestamp_ms,
                                uint32_t sequence_number) {
     EdgePeerPacket packet;
@@ -135,7 +148,10 @@ TEST(EdgePeerProtocol, CborEncodeDecodeHeartbeat) {
 
     ASSERT_TRUE(parsed.ok) << parsed.error;
     EXPECT_TRUE(equivalent_header(input, parsed.packet));
-    ASSERT_TRUE(parsed.packet.heartbeat.has_value());
+    if (!parsed.packet.heartbeat.has_value()) {
+        ADD_FAILURE() << "Missing parsed heartbeat payload";
+        return;
+    }
     EXPECT_EQ(parsed.packet.heartbeat->peer_count, 2);
     EXPECT_LT(wire.size(), serialize_edge_packet_json(input).size());
     EXPECT_EQ(metrics.mode, EdgeSerializationMode::CBOR);
@@ -155,7 +171,10 @@ TEST(EdgePeerProtocol, CborPacketEquivalenceObstacleDigest) {
 
     ASSERT_TRUE(parsed.ok) << parsed.error;
     EXPECT_TRUE(equivalent_header(input, parsed.packet));
-    ASSERT_TRUE(parsed.packet.obstacle_digest.has_value());
+    if (!parsed.packet.obstacle_digest.has_value()) {
+        ADD_FAILURE() << "Missing parsed obstacle digest";
+        return;
+    }
     EXPECT_EQ(parsed.packet.obstacle_digest->local_obstacle_count, 4);
     EXPECT_EQ(parsed.packet.obstacle_digest->digest_id, "digest-a1");
 }
@@ -259,6 +278,327 @@ TEST(EdgePeerProtocol, StaleSequenceRejected) {
     EXPECT_EQ(observed.reason, "stale sequence number");
 }
 
+TEST(PeerPacketAuth, RevokedSenderRejectedDespiteValidPerNodeHmac) {
+    auto alice = auth_config();
+    alice.mode = AuthMode::PER_NODE_HMAC_SHA256;
+    alice.local_node_id = 7u;
+    alice.local_signing_secret = std::string(32, 'A');
+    auto bob = alice;
+    bob.local_node_id = 8u;
+    bob.local_signing_secret = std::string(32, 'B');
+
+    auto receiver = auth_config();
+    receiver.mode = AuthMode::PER_NODE_HMAC_SHA256;
+    receiver.trusted_node_secrets.emplace(7u, std::string(32, 'A'));
+    receiver.trusted_node_secrets.emplace(8u, std::string(32, 'B'));
+
+    auto alice_packet = heartbeat(7, 1000, 1);
+    auto bob_packet = heartbeat(8, 1000, 1);
+    ASSERT_TRUE(signPacket(alice_packet, alice).accepted());
+    ASSERT_TRUE(signPacket(bob_packet, bob).accepted());
+    const auto initially_trusted = verifyPacket(alice_packet, receiver, 1000);
+    EXPECT_EQ(initially_trusted.result, PacketAuthResult::ACCEPTED);
+    receiver.revoked_sender_ids.insert(7u);
+    const auto revoked = verifyPacket(alice_packet, receiver, 1000);
+    EXPECT_EQ(revoked.result, PacketAuthResult::UNTRUSTED_SENDER);
+    EXPECT_EQ(verifyPacket(bob_packet, receiver, 1000).result, PacketAuthResult::ACCEPTED);
+
+    alice.revoked_sender_ids.insert(7u);
+    auto future = heartbeat(7, 1000, 2);
+    const auto signing = signPacket(future, alice);
+    EXPECT_EQ(signing.result, PacketAuthResult::UNTRUSTED_SENDER);
+}
+
+TEST(PeerPacketAuth, RevokedSenderRejectedDespiteValidPublicSignature) {
+    std::array<uint8_t, 32> seed_a{};
+    std::array<uint8_t, 32> seed_b{};
+    seed_a.fill(11u);
+    seed_b.fill(19u);
+
+    auto sender = auth_config();
+    sender.mode = AuthMode::MONOCYPHER_EDDSA_BLAKE2B;
+    sender.local_node_id = 7u;
+    sender.local_eddsa_seed = seed_a;
+    auto peer = sender;
+    peer.local_node_id = 8u;
+    peer.local_eddsa_seed = seed_b;
+
+    auto receiver = auth_config();
+    receiver.mode = AuthMode::MONOCYPHER_EDDSA_BLAKE2B;
+    receiver.trusted_node_public_keys.emplace(7u, monocypherPublicKeyFromSeed(seed_a));
+    receiver.trusted_node_public_keys.emplace(8u, monocypherPublicKeyFromSeed(seed_b));
+    auto first = heartbeat(7, 1000, 1);
+    auto second = heartbeat(8, 1000, 1);
+    ASSERT_TRUE(signPacket(first, sender).accepted());
+    ASSERT_TRUE(signPacket(second, peer).accepted());
+    receiver.revoked_sender_ids.insert(7u);
+    const auto blocked = verifyPacket(first, receiver, 1000);
+    EXPECT_EQ(blocked.result, PacketAuthResult::UNTRUSTED_SENDER);
+    EXPECT_EQ(verifyPacket(second, receiver, 1000).result, PacketAuthResult::ACCEPTED);
+}
+
+TEST(PeerPacketAuth, PublicKeyReplacementRejectsOldKeyAndOldEpoch) {
+    std::array<uint8_t, 32> old_seed{};
+    std::array<uint8_t, 32> new_seed{};
+    old_seed.fill(11u);
+    new_seed.fill(47u);
+    auto sender = auth_config();
+    sender.mode = AuthMode::MONOCYPHER_EDDSA_BLAKE2B;
+    sender.local_node_id = 7u;
+    sender.local_eddsa_seed = old_seed;
+    auto receiver = auth_config();
+    receiver.mode = AuthMode::MONOCYPHER_EDDSA_BLAKE2B;
+    receiver.trusted_node_public_keys.emplace(7u, monocypherPublicKeyFromSeed(old_seed));
+
+    auto previous = heartbeat(7, 1000, 1);
+    ASSERT_TRUE(signPacket(previous, sender).accepted());
+    EXPECT_EQ(verifyPacket(previous, receiver, 1000).result, PacketAuthResult::ACCEPTED);
+
+    receiver.trust_epoch = 2;
+    receiver.trusted_node_public_keys.at(7u) = monocypherPublicKeyFromSeed(new_seed);
+    const auto stale = verifyPacket(previous, receiver, 1000);
+    EXPECT_EQ(stale.result, PacketAuthResult::STALE_EPOCH);
+
+    auto rotated = heartbeat(7, 1000, 2);
+    rotated.trust_epoch = 2;
+    ASSERT_TRUE(signPacket(rotated, sender).accepted());
+    const auto wrong_key = verifyPacket(rotated, receiver, 1000);
+    EXPECT_EQ(wrong_key.result, PacketAuthResult::INVALID_SIGNATURE);
+
+    sender.trust_epoch = 2;
+    sender.local_eddsa_seed = new_seed;
+    ASSERT_TRUE(signPacket(rotated, sender).accepted());
+    EXPECT_EQ(verifyPacket(rotated, receiver, 1000).result, PacketAuthResult::ACCEPTED);
+}
+
+TEST(PeerPacketAuth, PublicKeyModeParsesAndDisplaysCorrectly) {
+    EXPECT_EQ(to_string(AuthMode::MONOCYPHER_EDDSA_BLAKE2B), "monocypher_eddsa_blake2b");
+    const auto parsed = parse_auth_mode("monocypher_eddsa_blake2b");
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed.value_or(AuthMode::NONE), AuthMode::MONOCYPHER_EDDSA_BLAKE2B);
+}
+
+TEST(PeerPacketAuth, MonocypherPublicKeyVerifiesTwoIndependentSenders) {
+    std::array<uint8_t, 32> seed_a{};
+    std::array<uint8_t, 32> seed_b{};
+    seed_a.fill(11u);
+    seed_b.fill(19u);
+    auto sender_a = auth_config();
+    sender_a.mode = AuthMode::MONOCYPHER_EDDSA_BLAKE2B;
+    sender_a.local_node_id = 7;
+    sender_a.local_eddsa_seed = seed_a;
+    auto sender_b = sender_a;
+    sender_b.local_node_id = 8;
+    sender_b.local_eddsa_seed = seed_b;
+
+    auto receiver = auth_config();
+    receiver.mode = AuthMode::MONOCYPHER_EDDSA_BLAKE2B;
+    receiver.trusted_node_public_keys.emplace(7u, monocypherPublicKeyFromSeed(seed_a));
+    receiver.trusted_node_public_keys.emplace(8u, monocypherPublicKeyFromSeed(seed_b));
+
+    auto first = heartbeat(7, 1000, 1);
+    auto second = heartbeat(8, 1000, 1);
+    ASSERT_TRUE(signPacket(first, sender_a).accepted());
+    ASSERT_TRUE(signPacket(second, sender_b).accepted());
+    EXPECT_EQ(verifyPacket(first, receiver, 1000).result, PacketAuthResult::ACCEPTED);
+    EXPECT_EQ(verifyPacket(second, receiver, 1000).result, PacketAuthResult::ACCEPTED);
+    const auto replay = verifyPacket(first, receiver, 1000, 1);
+    EXPECT_EQ(replay.result, PacketAuthResult::REPLAY_DETECTED);
+}
+
+TEST(PeerPacketAuth, MonocypherPublicKeyRejectsImpersonationAndTampering) {
+    std::array<uint8_t, 32> seed_a{};
+    std::array<uint8_t, 32> seed_b{};
+    seed_a.fill(11u);
+    seed_b.fill(19u);
+    auto attacker = auth_config();
+    attacker.mode = AuthMode::MONOCYPHER_EDDSA_BLAKE2B;
+    attacker.local_node_id = 7;
+    attacker.local_eddsa_seed = seed_a;
+    auto verifier = auth_config();
+    verifier.mode = AuthMode::MONOCYPHER_EDDSA_BLAKE2B;
+    verifier.trusted_node_public_keys.emplace(7u, monocypherPublicKeyFromSeed(seed_a));
+    verifier.trusted_node_public_keys.emplace(8u, monocypherPublicKeyFromSeed(seed_b));
+
+    auto impersonation = heartbeat(8, 1000, 1);
+    const auto rejected = signPacket(impersonation, attacker);
+    EXPECT_EQ(rejected.result, PacketAuthResult::UNTRUSTED_SENDER);
+
+    auto signed_packet = heartbeat(7, 1000, 2);
+    ASSERT_TRUE(signPacket(signed_packet, attacker).accepted());
+    signed_packet.sender_id = 8;
+    const auto identity_change = verifyPacket(signed_packet, verifier, 1000);
+    EXPECT_EQ(identity_change.result, PacketAuthResult::INVALID_SIGNATURE);
+    signed_packet.sender_id = 7;
+    signed_packet.sequence_number = 3;
+    const auto payload_change = verifyPacket(signed_packet, verifier, 1000);
+    EXPECT_EQ(payload_change.result, PacketAuthResult::INVALID_SIGNATURE);
+}
+
+TEST(PeerPacketAuth, MonocypherPublicKeyRejectsMalformedSignatureBytes) {
+    std::array<uint8_t, 32> seed{};
+    seed.fill(37u);
+    auto sender = auth_config();
+    sender.mode = AuthMode::MONOCYPHER_EDDSA_BLAKE2B;
+    sender.local_node_id = 7u;
+    sender.local_eddsa_seed = seed;
+
+    auto receiver = auth_config();
+    receiver.mode = AuthMode::MONOCYPHER_EDDSA_BLAKE2B;
+    receiver.trusted_node_public_keys.emplace(7u, monocypherPublicKeyFromSeed(seed));
+
+    auto packet = heartbeat(7, 1000, 1);
+    ASSERT_TRUE(signPacket(packet, sender).accepted());
+    EXPECT_EQ(verifyPacket(packet, receiver, 1000).result, PacketAuthResult::ACCEPTED);
+
+    packet.auth_hook = "monocypher_eddsa_blake2b:gg";
+    const auto malformed = verifyPacket(packet, receiver, 1000);
+    EXPECT_EQ(malformed.result, PacketAuthResult::INVALID_SIGNATURE);
+
+    packet.auth_hook = "monocypher_eddsa_blake2b:01";
+    const auto truncated = verifyPacket(packet, receiver, 1000);
+    EXPECT_EQ(truncated.result, PacketAuthResult::INVALID_SIGNATURE);
+}
+
+TEST(PeerPacketAuth, MonocypherPublicKeyRejectsDowngradeAndUnknownPeers) {
+    std::array<uint8_t, 32> seed{};
+    seed.fill(11u);
+    auto signing = auth_config();
+    signing.mode = AuthMode::MONOCYPHER_EDDSA_BLAKE2B;
+    signing.local_node_id = 7;
+    signing.local_eddsa_seed = seed;
+    auto receiver = auth_config();
+    receiver.mode = AuthMode::MONOCYPHER_EDDSA_BLAKE2B;
+
+    auto packet = heartbeat(7, 1000, 1);
+    const auto missing = signPacket(packet, receiver);
+    EXPECT_EQ(missing.result, PacketAuthResult::UNTRUSTED_SENDER);
+    ASSERT_TRUE(signPacket(packet, signing).accepted());
+    const auto unknown = verifyPacket(packet, receiver, 1000);
+    EXPECT_EQ(unknown.result, PacketAuthResult::UNTRUSTED_SENDER);
+
+    receiver.trusted_node_public_keys.emplace(7u, monocypherPublicKeyFromSeed(seed));
+    EXPECT_EQ(verifyPacket(packet, receiver, 1000).result, PacketAuthResult::ACCEPTED);
+    auto legacy = auth_config();
+    auto old_packet = heartbeat(7, 1000, 2);
+    ASSERT_TRUE(signPacket(old_packet, legacy).accepted());
+    const auto downgrade = verifyPacket(old_packet, receiver, 1000);
+    EXPECT_EQ(downgrade.result, PacketAuthResult::INVALID_SIGNATURE);
+    const auto reverse = verifyPacket(packet, legacy, 1000);
+    EXPECT_EQ(reverse.result, PacketAuthResult::INVALID_SIGNATURE);
+}
+
+TEST(PeerPacketAuth, PerNodeModeParsesAndDisplaysCorrectly) {
+    EXPECT_EQ(to_string(AuthMode::PER_NODE_HMAC_SHA256), "hmac_sha256_per_node");
+    const auto mode = parse_auth_mode("hmac_sha256_per_node");
+    ASSERT_TRUE(mode.has_value());
+    EXPECT_EQ(mode.value_or(AuthMode::NONE), AuthMode::PER_NODE_HMAC_SHA256);
+    EXPECT_EQ(to_string(PacketAuthResult::UNTRUSTED_SENDER), "untrusted_sender");
+}
+
+TEST(PeerPacketAuth, PerNodeHmacAcceptsProvisionedIndependentSenders) {
+    auto first_sender = auth_config();
+    first_sender.mode = AuthMode::PER_NODE_HMAC_SHA256;
+    first_sender.local_node_id = 7;
+    first_sender.local_signing_secret = std::string(32, 'A');
+
+    auto second_sender = first_sender;
+    second_sender.local_node_id = 8;
+    second_sender.local_signing_secret = std::string(32, 'B');
+
+    auto receiver = auth_config();
+    receiver.mode = AuthMode::PER_NODE_HMAC_SHA256;
+    receiver.trusted_node_secrets.emplace(7u, std::string(32, 'A'));
+    receiver.trusted_node_secrets.emplace(8u, std::string(32, 'B'));
+
+    auto first = heartbeat(7, 1000, 1);
+    auto second = heartbeat(8, 1000, 1);
+    ASSERT_TRUE(signPacket(first, first_sender).accepted());
+    ASSERT_TRUE(signPacket(second, second_sender).accepted());
+    EXPECT_EQ(verifyPacket(first, receiver, 1000).result, PacketAuthResult::ACCEPTED);
+    EXPECT_EQ(verifyPacket(second, receiver, 1000).result, PacketAuthResult::ACCEPTED);
+    const auto replay = verifyPacket(first, receiver, 1000, 1);
+    EXPECT_EQ(replay.result, PacketAuthResult::REPLAY_DETECTED);
+}
+
+TEST(PeerPacketAuth, PerNodeHmacRejectsInsiderSenderSubstitution) {
+    auto attacker = auth_config();
+    attacker.mode = AuthMode::PER_NODE_HMAC_SHA256;
+    attacker.local_node_id = 7;
+    attacker.local_signing_secret = std::string(32, 'A');
+
+    auto receiver = auth_config();
+    receiver.mode = AuthMode::PER_NODE_HMAC_SHA256;
+    receiver.trusted_node_secrets.emplace(7u, std::string(32, 'A'));
+    receiver.trusted_node_secrets.emplace(8u, std::string(32, 'B'));
+
+    auto claimed_peer = heartbeat(8, 1000, 1);
+    EXPECT_EQ(signPacket(claimed_peer, attacker).result, PacketAuthResult::UNTRUSTED_SENDER);
+
+    auto signed_as_attacker = heartbeat(7, 1000, 2);
+    ASSERT_TRUE(signPacket(signed_as_attacker, attacker).accepted());
+    signed_as_attacker.sender_id = 8;
+    EXPECT_EQ(verifyPacket(signed_as_attacker, receiver, 1000).result,
+              PacketAuthResult::INVALID_SIGNATURE);
+}
+
+TEST(PeerPacketAuth, PerNodeHmacHasNoSharedKeyOrUnsignedFallback) {
+    auto sender = auth_config();
+    sender.mode = AuthMode::PER_NODE_HMAC_SHA256;
+    sender.local_node_id = 7;
+    sender.local_signing_secret = std::string(32, 'A');
+
+    auto receiver = auth_config("simulation");
+    receiver.mode = AuthMode::PER_NODE_HMAC_SHA256;
+    receiver.trusted_node_secrets.emplace(7u, std::string(32, 'A'));
+    receiver.allow_unsigned_in_simulation = true;
+    auto packet = heartbeat(7, 1000, 1);
+    packet.source = "simulation";
+    const auto unsigned_result = verifyPacket(packet, receiver, 1000);
+    EXPECT_EQ(unsigned_result.result, PacketAuthResult::INVALID_SIGNATURE);
+    ASSERT_TRUE(signPacket(packet, sender).accepted());
+    EXPECT_EQ(verifyPacket(packet, receiver, 1000).result, PacketAuthResult::ACCEPTED);
+
+    auto legacy = auth_config();
+    auto legacy_packet = heartbeat(7, 1000, 2);
+    ASSERT_TRUE(signPacket(legacy_packet, legacy).accepted());
+    const auto downgrade = verifyPacket(legacy_packet, receiver, 1000);
+    EXPECT_EQ(downgrade.result, PacketAuthResult::INVALID_SIGNATURE);
+    const auto legacy_verification = verifyPacket(packet, legacy, 1000);
+    EXPECT_EQ(legacy_verification.result, PacketAuthResult::INVALID_SIGNATURE);
+}
+
+TEST(PeerPacketAuth, PerNodeHmacRejectsUnknownAndWrongKeys) {
+    auto sender = auth_config();
+    sender.mode = AuthMode::PER_NODE_HMAC_SHA256;
+    sender.local_node_id = 7;
+    sender.local_signing_secret = std::string(32, 'A');
+
+    auto receiver = auth_config();
+    receiver.mode = AuthMode::PER_NODE_HMAC_SHA256;
+    auto packet = heartbeat(7, 1000, 1);
+    ASSERT_TRUE(signPacket(packet, sender).accepted());
+    const auto unknown_sender = verifyPacket(packet, receiver, 1000);
+    EXPECT_EQ(unknown_sender.result, PacketAuthResult::UNTRUSTED_SENDER);
+    receiver.trusted_node_secrets.emplace(7u, std::string(32, 'B'));
+    const auto wrong_key = verifyPacket(packet, receiver, 1000);
+    EXPECT_EQ(wrong_key.result, PacketAuthResult::INVALID_SIGNATURE);
+    receiver.trusted_node_secrets.at(7u) = std::string(32, 'A');
+    EXPECT_EQ(verifyPacket(packet, receiver, 1000).result, PacketAuthResult::ACCEPTED);
+}
+
+TEST(PeerPacketAuth, PerNodeHmacRejectsMissingOrWeakSigningKey) {
+    auto sender = auth_config();
+    sender.mode = AuthMode::PER_NODE_HMAC_SHA256;
+    sender.local_node_id = 7;
+    auto packet = heartbeat(7, 1000, 1);
+    EXPECT_EQ(signPacket(packet, sender).result, PacketAuthResult::MISSING_SIGNATURE);
+    sender.local_signing_secret = "short";
+    EXPECT_EQ(signPacket(packet, sender).result, PacketAuthResult::MISSING_SIGNATURE);
+    sender.local_signing_secret = std::string(32, 'A');
+    EXPECT_EQ(signPacket(packet, sender).result, PacketAuthResult::ACCEPTED);
+}
+
 TEST(PeerPacketAuth, HmacSignedPacketVerifies) {
     auto packet = heartbeat(7, 1000, 1);
     auto cfg = auth_config();
@@ -272,6 +612,10 @@ TEST(PeerPacketAuth, TamperedPayloadRejected) {
     auto packet = heartbeat(7, 1000, 1);
     auto cfg = auth_config();
     ASSERT_TRUE(signPacket(packet, cfg).accepted());
+    if (!packet.heartbeat.has_value()) {
+        ADD_FAILURE() << "Missing heartbeat fixture payload";
+        return;
+    }
     packet.heartbeat->battery_pct = 12.0;
 
     const auto verified = verifyPacket(packet, cfg, 1000);
@@ -324,6 +668,389 @@ TEST(PeerPacketAuth, StaleSequenceRejected) {
     ASSERT_TRUE(signPacket(packet, cfg).accepted());
 
     EXPECT_EQ(verifyPacket(packet, cfg, 1000, 10).result, PacketAuthResult::REPLAY_DETECTED);
+}
+
+TEST(PeerPacketAuth, FutureTimestampBoundDoesNotGrowWithTtl) {
+    auto packet = heartbeat(7, 4000, 1);
+    auto cfg = auth_config();
+    packet.ttl_ms = 5000;
+    ASSERT_TRUE(signPacket(packet, cfg).accepted());
+    EXPECT_EQ(verifyPacket(packet, cfg, 2000).result, PacketAuthResult::ACCEPTED);
+    EXPECT_EQ(verifyPacket(packet, cfg, 1999).result, PacketAuthResult::FUTURE_TIMESTAMP);
+}
+
+TEST(PeerPacketAuth, SenderControlledTtlHasAnUpperBound) {
+    auto packet = heartbeat(7, 1000, 1);
+    auto cfg = auth_config();
+    packet.ttl_ms = cfg.max_packet_ttl_ms + 1;
+    ASSERT_TRUE(signPacket(packet, cfg).accepted());
+    EXPECT_EQ(verifyPacket(packet, cfg, 1000).result, PacketAuthResult::INVALID_TTL);
+    packet.ttl_ms = 0;
+    ASSERT_TRUE(signPacket(packet, cfg).accepted());
+    EXPECT_EQ(verifyPacket(packet, cfg, 1000).result, PacketAuthResult::INVALID_TTL);
+}
+
+TEST(PeerPacketAuth, StaleTimestampBoundary) {
+    auto packet = heartbeat(7, 1000, 1);
+    auto cfg = auth_config();
+    ASSERT_TRUE(signPacket(packet, cfg).accepted());
+    EXPECT_EQ(verifyPacket(packet, cfg, 4000).result, PacketAuthResult::ACCEPTED);
+    EXPECT_EQ(verifyPacket(packet, cfg, 4001).result, PacketAuthResult::STALE_TIMESTAMP);
+}
+
+TEST(PeerPacketAuth, ZeroClockSkewIsStrictNotDisabled) {
+    auto packet = heartbeat(7, 1000, 1);
+    auto cfg = auth_config();
+    cfg.max_clock_skew_ms = 0;
+    ASSERT_TRUE(signPacket(packet, cfg).accepted());
+    EXPECT_EQ(verifyPacket(packet, cfg, 1000).result, PacketAuthResult::ACCEPTED);
+    EXPECT_EQ(verifyPacket(packet, cfg, 999).result, PacketAuthResult::FUTURE_TIMESTAMP);
+    EXPECT_EQ(verifyPacket(packet, cfg, 2001).result, PacketAuthResult::STALE_TIMESTAMP);
+}
+
+TEST(PeerPacketAuth, AuthenticateBeforeClassifyingReplay) {
+    auto packet = heartbeat(7, 1000, 10);
+    auto cfg = auth_config();
+    ASSERT_TRUE(signPacket(packet, cfg).accepted());
+    packet.sender_id = 8;
+    EXPECT_EQ(verifyPacket(packet, cfg, 1000, 10).result, PacketAuthResult::INVALID_SIGNATURE);
+}
+
+TEST(PeerPacketAuth, ValidReorderedPacketRejectedByStrictSequence) {
+    auto older = heartbeat(7, 1000, 10);
+    auto newer = heartbeat(7, 1001, 11);
+    auto cfg = auth_config();
+    ASSERT_TRUE(signPacket(older, cfg).accepted());
+    ASSERT_TRUE(signPacket(newer, cfg).accepted());
+    EXPECT_EQ(verifyPacket(newer, cfg, 1001, 10).result, PacketAuthResult::ACCEPTED);
+    EXPECT_EQ(verifyPacket(older, cfg, 1001, 11).result, PacketAuthResult::REPLAY_DETECTED);
+}
+
+TEST(PeerPacketAuth, SharedSecretDoesNotAttributeOnePhysicalSender) {
+    auto forged = heartbeat(8, 1000, 12);
+    auto cfg = auth_config();
+    // The holder of the group key can sign a packet using another sender ID.
+    ASSERT_TRUE(signPacket(forged, cfg).accepted());
+    EXPECT_EQ(verifyPacket(forged, cfg, 1000).result, PacketAuthResult::ACCEPTED);
+}
+
+TEST(EdgePeerProtocol, CborUint32TruncationRejected) {
+    auto wire = serialize_edge_packet_cbor(heartbeat(7, 1000, 1));
+    ASSERT_GE(wire.size(), 4u);
+    ASSERT_EQ(wire[0], 0x8au);
+    ASSERT_EQ(wire[3], 7u);
+    // Replace the 1-byte sender ID with 2^32 + 7 (CBOR 64-bit integer).
+    std::vector<uint8_t> malformed(wire.begin(), wire.begin() + 3);
+    malformed.insert(malformed.end(), {0x1b, 0, 0, 0, 1, 0, 0, 0, 7});
+    malformed.insert(malformed.end(), wire.begin() + 4, wire.end());
+    const auto parsed = parse_edge_packet_cbor(malformed);
+    EXPECT_FALSE(parsed.ok);
+    EXPECT_EQ(parsed.error, "cbor integer field exceeds uint32 range");
+}
+
+TEST(EdgePeerProtocol, ExpirationArithmeticDoesNotWrap) {
+    auto packet = heartbeat(7, std::numeric_limits<uint64_t>::max() - 4, 1);
+    packet.ttl_ms = 1000;
+    EXPECT_FALSE(packet_is_expired(packet, std::numeric_limits<uint64_t>::max() - 3));
+    EXPECT_FALSE(packet_is_expired(packet, 1000));
+}
+
+TEST(SwarmStateCache, AuthenticatedClockSkewMatchesFreshnessWindow) {
+    SwarmStateCache cache({8, 100, 5000});
+    cache.configure_freshness({2000, 5000});
+    const auto packet = heartbeat(7, 1000, 10);
+    EXPECT_TRUE(cache.observe_packet(packet, 4000).accepted);
+    SwarmStateCache stale_cache({8, 100, 5000});
+    stale_cache.configure_freshness({2000, 5000});
+    EXPECT_FALSE(stale_cache.observe_packet(packet, 4001).accepted);
+}
+
+TEST(SwarmStateCache, ReplayMemorySurvivesShortPeerExpiry) {
+    SwarmStateCache cache({8, 100, 500});
+    cache.configure_freshness({2000, 1000});
+    ASSERT_TRUE(cache.observe_packet(heartbeat(7, 1000, 10), 1000).accepted);
+    cache.expire(2500);
+    ASSERT_TRUE(cache.last_sequence_number(7).has_value());
+    EXPECT_EQ(cache.last_sequence_number(7).value_or(0), 10u);
+    const auto replay = cache.observe_packet(heartbeat(7, 1000, 10), 2500);
+    EXPECT_FALSE(replay.accepted);
+    EXPECT_EQ(replay.reason, "stale sequence number");
+}
+
+TEST(SwarmStateCache, DurableReplayWindowSurvivesRestartAndClear) {
+    const auto timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto path = std::filesystem::temp_directory_path() /
+                      ("uav-replay-window-" + std::to_string(timestamp) + ".log");
+    {
+        SwarmStateCache cache;
+        ASSERT_TRUE(cache.configure_replay_ledger(path.string(), true));
+        ASSERT_TRUE(cache.observe_packet(heartbeat(7, 1000, 12), 1000).accepted);
+        ASSERT_TRUE(cache.observe_packet(heartbeat(7, 1000, 10), 1000).accepted);
+        cache.clear();
+        EXPECT_FALSE(cache.observe_packet(heartbeat(7, 1000, 12), 1000).accepted);
+        EXPECT_FALSE(cache.observe_packet(heartbeat(7, 1000, 10), 1000).accepted);
+    }
+    {
+        SwarmStateCache restarted;
+        ASSERT_TRUE(restarted.configure_replay_ledger(path.string()));
+        EXPECT_EQ(restarted.last_sequence_number(7).value_or(0), 12u);
+        EXPECT_FALSE(restarted.observe_packet(heartbeat(7, 1000, 12), 1000).accepted);
+        EXPECT_FALSE(restarted.observe_packet(heartbeat(7, 1000, 10), 1000).accepted);
+        ASSERT_TRUE(restarted.observe_packet(heartbeat(7, 1000, 11), 1000).accepted);
+        EXPECT_FALSE(restarted.observe_packet(heartbeat(7, 1000, 11), 1000).accepted);
+        EXPECT_TRUE(restarted.observe_packet(heartbeat(7, 1000, 13), 1000).accepted);
+    }
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+}
+
+TEST(SwarmStateCache, MissingReplayJournalFailsClosed) {
+    const auto timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto path = std::filesystem::temp_directory_path() /
+                      ("uav-missing-replay-" + std::to_string(timestamp) + ".log");
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+    SwarmStateCache cache;
+    EXPECT_FALSE(cache.configure_replay_ledger(path.string()));
+    const auto observed = cache.observe_packet(heartbeat(7, 1000, 1), 1000);
+    EXPECT_FALSE(observed.accepted);
+    EXPECT_EQ(observed.reason, "replay journal unavailable");
+}
+
+TEST(SwarmStateCache, TornReplayJournalFailsClosed) {
+    const auto timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto path = std::filesystem::temp_directory_path() /
+                      ("uav-torn-replay-" + std::to_string(timestamp) + ".log");
+    {
+        std::ofstream file(path, std::ios::binary);
+        file << "UAV_REPLAY_LEDGER_V1\nR 7 1 12 1";
+    }
+    SwarmStateCache cache;
+    EXPECT_FALSE(cache.configure_replay_ledger(path.string()));
+    EXPECT_FALSE(cache.observe_packet(heartbeat(7, 1000, 13), 1000).accepted);
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+}
+
+TEST(SwarmStateCache, DurableReplayWindowSurvivesPeerExpiry) {
+    const auto timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto path = std::filesystem::temp_directory_path() /
+                      ("uav-expired-replay-" + std::to_string(timestamp) + ".log");
+    {
+        SwarmStateCache cache({8, 100, 200});
+        ASSERT_TRUE(cache.configure_replay_ledger(path.string(), true));
+        ASSERT_TRUE(cache.observe_packet(heartbeat(7, 1000, 20), 1000).accepted);
+        cache.expire(8000);
+        EXPECT_EQ(cache.peer_count(), 0u);
+        EXPECT_FALSE(cache.observe_packet(heartbeat(7, 1000, 20), 1000).accepted);
+    }
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+}
+
+TEST(SwarmStateCache, SlidingWindowAcceptsUnseenReorderingAndRejectsDuplicates) {
+    SwarmStateCache cache;
+    ASSERT_TRUE(cache.observe_packet(heartbeat(7, 1000, 10), 1000).accepted);
+    ASSERT_TRUE(cache.observe_packet(heartbeat(7, 1000, 12), 1000).accepted);
+    ASSERT_TRUE(cache.observe_packet(heartbeat(7, 1000, 11), 1000).accepted);
+    EXPECT_EQ(cache.last_sequence_number(7).value_or(0), 12u);
+    EXPECT_FALSE(cache.observe_packet(heartbeat(7, 1000, 11), 1000).accepted);
+    EXPECT_FALSE(cache.observe_packet(heartbeat(7, 1000, 12), 1000).accepted);
+    EXPECT_EQ(cache.last_sequence_number(7).value_or(0), 12u);
+}
+
+TEST(SwarmStateCache, SlidingWindowBoundsOldPacketsAndLargeJumps) {
+    SwarmStateCache cache;
+    ASSERT_TRUE(cache.observe_packet(heartbeat(7, 1000, 2), 1000).accepted);
+    ASSERT_TRUE(cache.observe_packet(heartbeat(7, 1000, 70), 1000).accepted);
+    ASSERT_TRUE(cache.observe_packet(heartbeat(7, 1000, 7), 1000).accepted);
+    const auto too_old = cache.observe_packet(heartbeat(7, 1000, 6), 1000);
+    EXPECT_FALSE(too_old.accepted);
+    EXPECT_EQ(too_old.reason, "sequence outside replay window");
+    EXPECT_FALSE(cache.observe_packet(heartbeat(7, 1000, 7), 1000).accepted);
+    EXPECT_EQ(cache.last_sequence_number(7).value_or(0), 70u);
+}
+
+TEST(SwarmStateCache, ReorderedPacketsDoNotRollbackPeerState) {
+    SwarmStateCache cache;
+    auto newer = heartbeat(7, 1000, 11);
+    auto latest_heartbeat = newer.heartbeat.value_or(HeartbeatPayload{});
+    latest_heartbeat.peer_count = 81;
+    newer.heartbeat = latest_heartbeat;
+    auto older = heartbeat(7, 999, 10);
+    auto previous_heartbeat = older.heartbeat.value_or(HeartbeatPayload{});
+    previous_heartbeat.peer_count = 25;
+    older.heartbeat = previous_heartbeat;
+    ASSERT_TRUE(cache.observe_packet(newer, 1000).accepted);
+    ASSERT_TRUE(cache.observe_packet(older, 1000).accepted);
+    const auto state = cache.peer_state(7);
+    ASSERT_TRUE(state.has_value());
+    const auto cached = state.value_or(CachedPeerState{});
+    EXPECT_EQ(cached.last_sequence_number, 11u);
+    EXPECT_EQ(cached.last_packet_timestamp_ms, 1000u);
+    EXPECT_EQ(cached.last_heartbeat_timestamp_ms, 1000u);
+    EXPECT_EQ(cached.peer_count, 81);
+}
+
+TEST(SwarmStateCache, EpochChangeResetsWindowButRollbackFails) {
+    SwarmStateCache cache;
+    const auto max_sequence = heartbeat(7, 1000, std::numeric_limits<uint32_t>::max());
+    ASSERT_TRUE(cache.observe_packet(max_sequence, 1000).accepted);
+    EXPECT_FALSE(cache.observe_packet(heartbeat(7, 1000, 0), 1000).accepted);
+    auto fresh_epoch = heartbeat(7, 1000, 0);
+    fresh_epoch.trust_epoch = 2;
+    ASSERT_TRUE(cache.observe_packet(fresh_epoch, 1000).accepted);
+    EXPECT_EQ(cache.last_sequence_number(7).value_or(1), 0u);
+    EXPECT_FALSE(cache.observe_packet(heartbeat(7, 1000, 1), 1000).accepted);
+}
+
+TEST(PeerPacketAuth, SlidingWindowAdmissionAuthenticatesBeforeCacheUpdate) {
+    auto cfg = auth_config();
+    SwarmStateCache cache;
+    for (const auto sequence : {12u, 11u}) {
+        auto packet = heartbeat(7, 1000, sequence);
+        ASSERT_TRUE(signPacket(packet, cfg).accepted());
+        ASSERT_TRUE(verifyPacket(packet, cfg, 1000).accepted());
+        EXPECT_TRUE(cache.observe_packet(packet, 1000).accepted);
+    }
+    auto tampered = heartbeat(7, 1000, 10);
+    ASSERT_TRUE(signPacket(tampered, cfg).accepted());
+    tampered.sender_id = 8;
+    EXPECT_EQ(verifyPacket(tampered, cfg, 1000).result, PacketAuthResult::INVALID_SIGNATURE);
+    EXPECT_FALSE(cache.last_sequence_number(8).has_value());
+}
+
+TEST(PeerPacketAuth, SyntheticPacketReorderingAndLossStudy) {
+    // Deterministic delivery traces, not measurements from a physical FANET radio.
+    struct Trace {
+        const char* name;
+        size_t swap_every;
+        size_t drop_every;
+    };
+    const std::array<Trace, 4> traces = {{
+        {"ordered", 0, 0},
+        {"adjacent_reorder", 2, 0},
+        {"sparse_reorder", 10, 0},
+        {"loss_and_reorder", 8, 13},
+    }};
+    auto cfg = auth_config();
+    for (const auto& trace : traces) {
+        std::vector<EdgePeerPacket> packets;
+        for (uint32_t seq = 1; seq <= 128; ++seq) {
+            if (trace.drop_every > 0 && seq % trace.drop_every == 0) {
+                continue;
+            }
+            auto packet = heartbeat(7, 1000, seq);
+            ASSERT_TRUE(signPacket(packet, cfg).accepted());
+            packets.push_back(std::move(packet));
+        }
+        if (trace.swap_every > 0) {
+            for (size_t i = 0; i + 1 < packets.size(); i += trace.swap_every) {
+                std::swap(packets[i], packets[i + 1]);
+            }
+        }
+        SwarmStateCache cache;
+        std::optional<uint32_t> highest_arrival;
+        size_t out_of_order = 0;
+        size_t accepted = 0;
+        size_t rejected = 0;
+        for (const auto& packet : packets) {
+            if (highest_arrival && packet.sequence_number <= *highest_arrival) {
+                ++out_of_order;
+            }
+            const auto outcome = verifyPacket(packet, cfg, 1000);
+            ASSERT_TRUE(outcome.accepted());
+            const auto observed = cache.observe_packet(packet, 1000);
+            if (observed.accepted) {
+                ++accepted;
+            } else {
+                ++rejected;
+            }
+            if (!highest_arrival || packet.sequence_number > *highest_arrival) {
+                highest_arrival = packet.sequence_number;
+            }
+        }
+        EXPECT_EQ(rejected, 0u);
+        EXPECT_EQ(accepted + rejected, packets.size());
+        std::cout << "[peer-auth-synthetic-delivery] name=" << trace.name;
+        std::cout << " transmitted=128 delivered=" << packets.size();
+        std::cout << " accepted=" << accepted << " false_rejected=" << rejected;
+        const double delivered_count = static_cast<double>(packets.size());
+        const double out_of_order_rate = static_cast<double>(out_of_order) / delivered_count;
+        std::cout << " out_of_order_rate=" << out_of_order_rate;
+        std::cout << '\n';
+    }
+}
+
+TEST(PeerPacketAuth, HmacSha256KnownAnswer) {
+    const std::string message = "The quick brown fox jumps over the lazy dog";
+    const std::vector<uint8_t> input(message.begin(), message.end());
+    const auto digest = hmacSha256Digest("key", input);
+    constexpr char hex[] = "0123456789abcdef";
+    std::string actual;
+    actual.reserve(digest.size() * 2);
+    for (const auto byte : digest) {
+        actual.push_back(hex[byte >> 4]);
+        actual.push_back(hex[byte & 0x0f]);
+    }
+    EXPECT_EQ(actual, "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8");
+}
+
+TEST(PeerPacketAuth, InProcessComponentLatencySamples) {
+    auto packet = heartbeat(7, 1000, 1);
+    auto cfg = auth_config();
+    packet.auth_hook.clear();
+    const auto data = serialize_edge_packet_cbor(packet);
+    constexpr size_t samples = 512;
+    std::array<std::vector<uint64_t>, 4> durations;
+    for (auto& group : durations) {
+        group.reserve(samples);
+    }
+    uint8_t digest_sink = 0;
+    using clock = std::chrono::steady_clock;
+    for (size_t i = 0; i < samples; ++i) {
+        auto begin = clock::now();
+        const auto encoded = serialize_edge_packet_cbor(packet);
+        auto finish = clock::now();
+        durations[0].push_back(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(finish - begin).count()));
+        digest_sink ^= static_cast<uint8_t>(encoded.size());
+
+        begin = clock::now();
+        const auto mac = hmacSha256Digest(cfg.shared_secret, data);
+        finish = clock::now();
+        durations[1].push_back(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(finish - begin).count()));
+        digest_sink ^= mac[i % mac.size()];
+
+        auto signed_packet = packet;
+        begin = clock::now();
+        const auto signed_result = signPacket(signed_packet, cfg);
+        finish = clock::now();
+        ASSERT_TRUE(signed_result.accepted());
+        durations[2].push_back(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(finish - begin).count()));
+
+        begin = clock::now();
+        const auto verified = verifyPacket(signed_packet, cfg, 1000);
+        finish = clock::now();
+        ASSERT_TRUE(verified.accepted());
+        durations[3].push_back(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(finish - begin).count()));
+    }
+    const std::array<const char*, 4> names = {"cbor_serialize", "hmac_sha256", "sign_path",
+                                              "verify_path"};
+    for (size_t i = 0; i < names.size(); ++i) {
+        auto& values = durations[i];
+        std::sort(values.begin(), values.end());
+        std::cout << "[peer-auth-inprocess] " << names[i] << " n=" << values.size();
+        std::cout << " p50_ns=" << values[values.size() / 2];
+        std::cout << " p95_ns=" << values[values.size() * 95 / 100];
+        std::cout << " p99_ns=" << values[values.size() * 99 / 100];
+        std::cout << " min_ns=" << values.front() << " max_ns=" << values.back() << '\n';
+    }
+    std::cout << "[peer-auth-inprocess] canonical_cbor_bytes=" << data.size()
+              << " digest_sink=" << static_cast<unsigned>(digest_sink) << "\n";
 }
 
 TEST(PeerPacketAuth, PqcPlaceholderReturnsUnsupported) {
